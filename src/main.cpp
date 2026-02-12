@@ -1,6 +1,7 @@
 /*
  * resetprop - get/set/list Android system properties.
  * Uses bionic __system_property_* API on Android.
+ * Compatible with API 21+ (uses __system_property_read on API < 26).
  *
  * Copyright (C) Magisk (original resetprop)
  * Copyright (C) YukiSU - standalone C++ implementation
@@ -21,8 +22,6 @@
 
 namespace {
 
-constexpr int PROP_VALUE_MAX = 92;
-
 static void usage(std::ostream& out, const char* prog) {
     out << "Usage: " << prog << " [NAME [VALUE]]\n"
         << "  No args     List all properties (name=value).\n"
@@ -33,6 +32,8 @@ static void usage(std::ostream& out, const char* prog) {
 }
 
 #if defined(__ANDROID__)
+
+#if __ANDROID_API__ >= 26
 
 struct GetCookie {
     char* out;
@@ -66,6 +67,26 @@ static void list_foreach_callback(const prop_info* pi, void* cookie) {
     __system_property_read_callback(pi, list_read_callback, out);
 }
 
+#else  // API < 26: use deprecated __system_property_read
+
+static int prop_get(const char* name, char* value) {
+    const prop_info* pi = __system_property_find(name);
+    if (!pi) return -1;
+    char name_buf[PROP_NAME_MAX];
+    int ret = __system_property_read(pi, name_buf, value);
+    return ret > 0 ? ret : -1;
+}
+
+static void list_foreach_callback(const prop_info* pi, void* cookie) {
+    auto* out = static_cast<std::vector<std::pair<std::string, std::string>>*>(cookie);
+    char name_buf[PROP_NAME_MAX];
+    char value_buf[PROP_VALUE_MAX];
+    if (__system_property_read(pi, name_buf, value_buf) > 0)
+        out->emplace_back(name_buf, value_buf);
+}
+
+#endif  // __ANDROID_API__ >= 26
+
 #endif  // __ANDROID__
 
 }  // namespace
@@ -88,10 +109,12 @@ int resetprop_main(int argc, char** argv) {
     return 1;
 #else
 
+#if __ANDROID_API__ >= 26
     if (__system_properties_init() != 0) {
         std::cerr << "resetprop: __system_properties_init failed\n";
         return 1;
     }
+#endif
 
     if (argc == 1) {
         std::vector<std::pair<std::string, std::string>> props;
