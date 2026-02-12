@@ -33,7 +33,7 @@ static void usage(std::ostream& out, const char* prog) {
 
 #if defined(__ANDROID__)
 
-#if __ANDROID_API__ >= 26
+#if defined(__ANDROID_API__) && __ANDROID_API__ >= 26
 
 struct GetCookie {
     char* out;
@@ -85,7 +85,7 @@ static void list_foreach_callback(const prop_info* pi, void* cookie) {
         out->emplace_back(name_buf, value_buf);
 }
 
-#endif  // __ANDROID_API__ >= 26
+#endif  // defined(__ANDROID_API__) && __ANDROID_API__ >= 26
 
 #endif  // __ANDROID__
 
@@ -109,7 +109,7 @@ int resetprop_main(int argc, char** argv) {
     return 1;
 #else
 
-#if __ANDROID_API__ >= 26
+#if defined(__ANDROID_API__) && __ANDROID_API__ >= 26
     if (__system_properties_init() != 0) {
         std::cerr << "resetprop: __system_properties_init failed\n";
         return 1;
