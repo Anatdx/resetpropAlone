@@ -1,0 +1,6 @@
+build/
+build_android/
+build_android_*/
+*.o
+resetprop
+.DS_Store
