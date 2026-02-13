@@ -93,6 +93,9 @@ static void list_foreach_callback(const prop_info* pi, void* cookie) {
 
 extern "C" {
 
+/* Stub for NDK link; device libc may provide the real symbol at runtime. */
+int __system_properties_init(void) { return 0; }
+
 int resetprop_main(int argc, char** argv) {
     const char* prog = (argv && argv[0]) ? argv[0] : "resetprop";
 
