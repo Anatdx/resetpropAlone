@@ -99,6 +99,10 @@ static void list_foreach_callback(const prop_info* pi, void* cookie) {
 
 #endif  // defined(__ANDROID_API__) && __ANDROID_API__ >= 26
 
+#if !defined(PROP_DIRNAME)
+#define PROP_DIRNAME "/dev/__properties__"
+#endif
+
 constexpr const char* kPropertyDir = PROP_DIRNAME;
 constexpr mode_t kWritableMode = 0644;
 constexpr mode_t kReadonlyMode = 0444;
