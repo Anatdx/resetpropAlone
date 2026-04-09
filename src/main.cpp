@@ -1,3 +1,7 @@
+#include "prop_area.hpp"
+#include "persistent_props.hpp"
+#include "property_contexts.hpp"
+
 /*
  * resetprop - get/set/list Android system properties.
  * Uses bionic __system_property_* API on Android.
@@ -10,17 +14,23 @@
  */
 
 #include <chrono>
+#include <algorithm>
 #include <cerrno>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <fstream>
 #include <iostream>
+#include <map>
+#include <optional>
 #include <string>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <sys/time.h>
 #include <thread>
 #include <unistd.h>
 #include <utility>
@@ -33,55 +43,82 @@
 namespace {
 
 static void usage(std::ostream& out, const char* prog) {
-    out << "Usage: " << prog << " [-n] [NAME [VALUE]]\n"
-        << "  No args     List all properties (name=value).\n"
-        << "  NAME        Get property value (like getprop NAME).\n"
-        << "  NAME VALUE  Set property (like setprop NAME VALUE).\n"
-        << "Options:\n"
-        << "  -n          Accept compatibility mode and skip init-side effects.\n"
-        << "  -w NAME VAL Wait until property NAME equals VAL.\n"
-        << "  -h, --help  Show this help.\n";
+    out << "resetprop - System Property Manipulation Tool\n\n"
+        << "Usage: " << prog << " [flags] [arguments...]\n\n"
+        << "Read mode arguments:\n"
+        << "  (no arguments)    print all properties\n"
+        << "  NAME              get property NAME\n\n"
+        << "Write mode arguments:\n"
+        << "  NAME VALUE        set property NAME as VALUE\n"
+        << "  -f, --file FILE   load and set properties from FILE\n"
+        << "  -d, --delete NAME delete property\n"
+        << "  -c, --compact [CONTEXT] compact property area files\n\n"
+        << "Wait mode arguments (toggled with -w):\n"
+        << "  NAME              wait until property NAME exists or changes\n"
+        << "  NAME OLD_VALUE    if property NAME is not OLD_VALUE, return immediately;\n"
+        << "                    otherwise wait until NAME changes\n\n"
+        << "General flags:\n"
+        << "  -h, --help        show this message\n"
+        << "  -v, --verbose     print verbose information to stderr\n"
+        << "  -w                switch to wait mode\n"
+        << "  --timeout SEC     timeout for wait mode\n\n"
+        << "Read mode flags:\n"
+        << "  -p                also read persistent properties from storage\n"
+        << "  -P                only read persistent properties from storage\n"
+        << "  -Z                print property context instead of value\n"
+        << "  -A, --area-path   print backing prop-area path instead of value\n"
+        << "  --context-type    print detected property context backend\n"
+        << "  --serial-path     print global property serial area path\n\n"
+        << "Write mode flags:\n"
+        << "  -n                set properties bypassing property_service\n"
+        << "  -p                also write persistent prop changes to storage\n";
 }
 
 #if defined(__ANDROID__)
+
+using PropertyMap = std::map<std::string, std::string>;
 
 #if defined(__ANDROID_API__) && __ANDROID_API__ >= 26
 
 struct GetCookie {
     char* out;
+    uint32_t* serial;
     bool done;
 };
 
-static void get_callback(void* cookie, const char* /*name*/, const char* value, uint32_t /*serial*/) {
+static void get_callback(void* cookie, const char* /*name*/, const char* value, uint32_t serial) {
     auto* c = static_cast<GetCookie*>(cookie);
     if (value) {
         strncpy(c->out, value, PROP_VALUE_MAX - 1);
         c->out[PROP_VALUE_MAX - 1] = '\0';
     }
+    if (c->serial != nullptr) {
+        *c->serial = serial;
+    }
     c->done = true;
 }
 
-static int prop_get(const char* name, char* value) {
+static int prop_get(const char* name, char* value, uint32_t* serial = nullptr) {
     const prop_info* pi = __system_property_find(name);
     if (!pi) return -1;
-    GetCookie cb{value, false};
+    GetCookie cb{value, serial, false};
     __system_property_read_callback(pi, get_callback, &cb);
     return cb.done ? static_cast<int>(strlen(value)) : -1;
 }
 
 static void list_read_callback(void* cookie, const char* name, const char* value, uint32_t /*serial*/) {
-    auto* out = static_cast<std::vector<std::pair<std::string, std::string>>*>(cookie);
-    out->emplace_back(name ? name : "", value ? value : "");
+    auto* out = static_cast<PropertyMap*>(cookie);
+    (*out)[name ? name : ""] = value ? value : "";
 }
 
 static void list_foreach_callback(const prop_info* pi, void* cookie) {
-    auto* out = static_cast<std::vector<std::pair<std::string, std::string>>*>(cookie);
+    auto* out = static_cast<PropertyMap*>(cookie);
     __system_property_read_callback(pi, list_read_callback, out);
 }
 
 #else  // API < 26: use deprecated __system_property_read
 
-static int prop_get(const char* name, char* value) {
+static int prop_get(const char* name, char* value, uint32_t* /*serial*/ = nullptr) {
     const prop_info* pi = __system_property_find(name);
     if (!pi) return -1;
     char name_buf[PROP_NAME_MAX];
@@ -90,11 +127,11 @@ static int prop_get(const char* name, char* value) {
 }
 
 static void list_foreach_callback(const prop_info* pi, void* cookie) {
-    auto* out = static_cast<std::vector<std::pair<std::string, std::string>>*>(cookie);
+    auto* out = static_cast<PropertyMap*>(cookie);
     char name_buf[PROP_NAME_MAX];
     char value_buf[PROP_VALUE_MAX];
     if (__system_property_read(pi, name_buf, value_buf) > 0)
-        out->emplace_back(name_buf, value_buf);
+        (*out)[name_buf] = value_buf;
 }
 
 #endif  // defined(__ANDROID_API__) && __ANDROID_API__ >= 26
@@ -104,6 +141,8 @@ static void list_foreach_callback(const prop_info* pi, void* cookie) {
 #endif
 
 constexpr const char* kPropertyDir = PROP_DIRNAME;
+constexpr const char* kAppcompatDir = "/dev/__properties__/appcompat_override";
+constexpr const char* kAppcompatPrefix = "ro.appcompat_override.";
 constexpr mode_t kWritableMode = 0644;
 constexpr mode_t kReadonlyMode = 0444;
 constexpr auto kWaitPollInterval = std::chrono::milliseconds(200);
@@ -317,6 +356,36 @@ private:
 
 using SystemPropertyAddFn = int (*)(const char*, unsigned int, const char*, unsigned int);
 using SystemPropertyUpdateFn = int (*)(prop_info*, const char*, unsigned int);
+using SystemPropertyDeleteFn = int (*)(const char*, bool);
+using SystemPropertyGetContextFn = const char* (*)(const char*);
+using SystemPropertiesInitFn = int (*)();
+using SystemPropertyWaitFn = bool (*)(const prop_info*, uint32_t, uint32_t*, const timespec*);
+using SystemPropertyAreaSerialFn = uint32_t (*)();
+
+struct Options {
+    bool verbose = false;
+    bool wait_mode = false;
+    bool persist = false;
+    bool persist_only = false;
+    bool show_context = false;
+    bool show_area_path = false;
+    bool show_context_type = false;
+    bool show_serial_path = false;
+    bool skip_svc = false;
+    bool delete_mode = false;
+    bool compact_mode = false;
+    const char* file = nullptr;
+    std::optional<double> timeout_seconds;
+    std::vector<const char*> positional;
+};
+
+bool g_verbose = false;
+
+void verbose_log(const std::string& message) {
+    if (g_verbose) {
+        std::cerr << "resetprop: " << message << "\n";
+    }
+}
 
 static bool resolve_property_mutators(SystemPropertyUpdateFn* update_fn, SystemPropertyAddFn* add_fn) {
     static bool resolved = false;
@@ -336,6 +405,212 @@ static bool resolve_property_mutators(SystemPropertyUpdateFn* update_fn, SystemP
     return cached_update != nullptr && cached_add != nullptr;
 }
 
+static SystemPropertyDeleteFn resolve_property_delete() {
+    static bool resolved = false;
+    static SystemPropertyDeleteFn cached_delete = nullptr;
+
+    if (!resolved) {
+        cached_delete = reinterpret_cast<SystemPropertyDeleteFn>(
+            dlsym(RTLD_DEFAULT, "__system_property_delete"));
+        resolved = true;
+    }
+
+    return cached_delete;
+}
+
+static SystemPropertiesInitFn resolve_properties_init() {
+    static bool resolved = false;
+    static SystemPropertiesInitFn cached_init = nullptr;
+
+    if (!resolved) {
+        cached_init = reinterpret_cast<SystemPropertiesInitFn>(
+            dlsym(RTLD_DEFAULT, "__system_properties_init"));
+        resolved = true;
+    }
+
+    return cached_init;
+}
+
+static SystemPropertyGetContextFn resolve_property_get_context() {
+    static bool resolved = false;
+    static SystemPropertyGetContextFn cached_get_context = nullptr;
+
+    if (!resolved) {
+        cached_get_context = reinterpret_cast<SystemPropertyGetContextFn>(
+            dlsym(RTLD_DEFAULT, "__system_property_get_context"));
+        resolved = true;
+    }
+
+    return cached_get_context;
+}
+
+static SystemPropertyWaitFn resolve_property_wait() {
+    static bool resolved = false;
+    static SystemPropertyWaitFn cached_wait = nullptr;
+
+    if (!resolved) {
+        cached_wait = reinterpret_cast<SystemPropertyWaitFn>(
+            dlsym(RTLD_DEFAULT, "__system_property_wait"));
+        resolved = true;
+    }
+
+    return cached_wait;
+}
+
+static SystemPropertyAreaSerialFn resolve_property_area_serial() {
+    static bool resolved = false;
+    static SystemPropertyAreaSerialFn cached_area_serial = nullptr;
+
+    if (!resolved) {
+        cached_area_serial = reinterpret_cast<SystemPropertyAreaSerialFn>(
+            dlsym(RTLD_DEFAULT, "__system_property_area_serial"));
+        resolved = true;
+    }
+
+    return cached_area_serial;
+}
+
+static bool parse_double_arg(const char* text, double* value) {
+    char* end = nullptr;
+    errno = 0;
+    const double parsed = std::strtod(text, &end);
+    if (errno != 0 || end == text || (end != nullptr && *end != '\0')) {
+        return false;
+    }
+    *value = parsed;
+    return true;
+}
+
+static std::string trim(std::string value) {
+    auto not_space = [](unsigned char ch) { return !std::isspace(ch); };
+    value.erase(value.begin(), std::find_if(value.begin(), value.end(), not_space));
+    value.erase(std::find_if(value.rbegin(), value.rend(), not_space).base(), value.end());
+    return value;
+}
+
+static bool parse_options(int argc, char** argv, Options* options, std::string* error) {
+    for (int i = 1; i < argc; ++i) {
+        const char* arg = argv[i];
+        if (std::strcmp(arg, "-h") == 0 || std::strcmp(arg, "--help") == 0) {
+            return true;
+        }
+        if (std::strcmp(arg, "-v") == 0 || std::strcmp(arg, "--verbose") == 0) {
+            options->verbose = true;
+            continue;
+        }
+        if (std::strcmp(arg, "-w") == 0) {
+            options->wait_mode = true;
+            continue;
+        }
+        if (std::strcmp(arg, "-p") == 0) {
+            options->persist = true;
+            continue;
+        }
+        if (std::strcmp(arg, "-P") == 0) {
+            options->persist = true;
+            options->persist_only = true;
+            continue;
+        }
+        if (std::strcmp(arg, "-Z") == 0) {
+            options->show_context = true;
+            continue;
+        }
+        if (std::strcmp(arg, "-A") == 0 || std::strcmp(arg, "--area-path") == 0) {
+            options->show_area_path = true;
+            continue;
+        }
+        if (std::strcmp(arg, "--context-type") == 0) {
+            options->show_context_type = true;
+            continue;
+        }
+        if (std::strcmp(arg, "--serial-path") == 0) {
+            options->show_serial_path = true;
+            continue;
+        }
+        if (std::strcmp(arg, "-n") == 0) {
+            options->skip_svc = true;
+            continue;
+        }
+        if (std::strcmp(arg, "-d") == 0 || std::strcmp(arg, "--delete") == 0) {
+            options->delete_mode = true;
+            continue;
+        }
+        if (std::strcmp(arg, "-c") == 0 || std::strcmp(arg, "--compact") == 0) {
+            options->compact_mode = true;
+            continue;
+        }
+        if (std::strcmp(arg, "-f") == 0 || std::strcmp(arg, "--file") == 0) {
+            if (i + 1 >= argc) {
+                *error = "missing file path after --file";
+                return false;
+            }
+            options->file = argv[++i];
+            continue;
+        }
+        if (std::strcmp(arg, "--timeout") == 0) {
+            if (i + 1 >= argc) {
+                *error = "missing value after --timeout";
+                return false;
+            }
+            double timeout = 0;
+            if (!parse_double_arg(argv[++i], &timeout) || timeout < 0) {
+                *error = "invalid timeout value";
+                return false;
+            }
+            options->timeout_seconds = timeout;
+            continue;
+        }
+        options->positional.push_back(arg);
+    }
+
+    return true;
+}
+
+static bool deadline_reached(const std::optional<std::chrono::steady_clock::time_point>& deadline) {
+    return deadline.has_value() && std::chrono::steady_clock::now() >= *deadline;
+}
+
+static const timespec* remaining_wait_timespec(
+    const std::optional<std::chrono::steady_clock::time_point>& deadline,
+    timespec* spec) {
+    if (!deadline.has_value()) {
+        return nullptr;
+    }
+
+    auto remaining = *deadline - std::chrono::steady_clock::now();
+    if (remaining < std::chrono::steady_clock::duration::zero()) {
+        remaining = std::chrono::steady_clock::duration::zero();
+    }
+
+    const auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(remaining);
+    spec->tv_sec = static_cast<time_t>(nanos.count() / 1000000000ll);
+    spec->tv_nsec = static_cast<long>(nanos.count() % 1000000000ll);
+    return spec;
+}
+
+static bool wait_for_property_change(SystemPropertyWaitFn wait_fn,
+                                     const prop_info* pi,
+                                     uint32_t old_serial,
+                                     const std::optional<std::chrono::steady_clock::time_point>& deadline,
+                                     bool* timed_out) {
+    if (wait_fn == nullptr) {
+        return false;
+    }
+    if (deadline_reached(deadline)) {
+        *timed_out = true;
+        return false;
+    }
+
+    timespec ts {};
+    uint32_t new_serial = 0;
+    const bool changed =
+        wait_fn(pi, old_serial, &new_serial, remaining_wait_timespec(deadline, &ts));
+    if (!changed && deadline.has_value()) {
+        *timed_out = true;
+    }
+    return changed;
+}
+
 static bool set_property_direct(const char* name, const char* value) {
     SystemPropertyUpdateFn update_fn = nullptr;
     SystemPropertyAddFn add_fn = nullptr;
@@ -345,20 +620,438 @@ static bool set_property_direct(const char* name, const char* value) {
     }
 
     const prop_info* pi = __system_property_find(name);
-    if (pi != nullptr) {
-        auto* mutable_pi = const_cast<prop_info*>(pi);
-        return update_fn(mutable_pi, value, strlen(value)) == 0;
+    if (pi == nullptr) {
+        return false;
     }
-    return add_fn(name, strlen(name), value, strlen(value)) == 0;
+    auto* mutable_pi = const_cast<prop_info*>(pi);
+    return update_fn(mutable_pi, value, strlen(value)) == 0;
 }
 
-static bool wait_for_property_value(const char* name, const char* expected) {
-    while (true) {
-        char value[PROP_VALUE_MAX] = {};
-        if (prop_get(name, value) >= 0 && strcmp(value, expected) == 0) {
+static bool delete_property_direct(const char* name, bool* deleted) {
+    *deleted = false;
+
+    if (__system_property_find(name) == nullptr) {
+        return true;
+    }
+
+    const auto delete_fn = resolve_property_delete();
+    if (delete_fn != nullptr && delete_fn(name, true) == 0) {
+        *deleted = (__system_property_find(name) == nullptr);
+        if (*deleted) {
             return true;
         }
-        std::this_thread::sleep_for(kWaitPollInterval);
+        verbose_log(std::string("property still visible after runtime delete, falling back to prop-area edit: ") +
+                    name);
+    } else if (delete_fn == nullptr) {
+        verbose_log(std::string("property delete symbol is unavailable, falling back to prop-area edit: ") +
+                    name);
+    } else {
+        verbose_log(std::string("direct property delete failed, falling back to prop-area edit: ") +
+                    name);
+    }
+
+    ScopedPropertyWriteAccess access;
+    if (!access.active()) {
+        std::cerr << "resetprop: failed to gain write access to property area\n";
+        return false;
+    }
+
+    std::string error;
+    if (!resetprop::delete_property_by_scanning(kPropertyDir, name, deleted, &error)) {
+        std::cerr << "resetprop: prop-area delete failed for " << name << ": " << error << "\n";
+        return false;
+    }
+
+    return true;
+}
+
+static bool is_persist_property(const char* name) {
+    return std::strncmp(name, "persist.", 8) == 0;
+}
+
+static bool is_read_only_property(const char* name) {
+    return std::strncmp(name, "ro.", 3) == 0;
+}
+
+static bool get_property_context_value(const std::string& name,
+                                       std::string* context,
+                                       std::string* error);
+
+static bool get_property_area_path_value(const char* props_root,
+                                         const std::string& name,
+                                         std::string* path,
+                                         std::string* context,
+                                         std::string* error);
+
+static bool bump_property_serial_for_root(const char* props_root, std::string* error);
+
+static bool directory_exists(const char* path) {
+    struct stat st {};
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static std::string strip_appcompat_prefix(const std::string& name) {
+    if (name.rfind(kAppcompatPrefix, 0) == 0) {
+        return name.substr(std::strlen(kAppcompatPrefix));
+    }
+    return name;
+}
+
+static bool maybe_mirror_appcompat_set(const char* name,
+                                       const char* value,
+                                       std::string* error) {
+    if (!directory_exists(kAppcompatDir) || !is_read_only_property(name)) {
+        return true;
+    }
+    const std::string override_key = strip_appcompat_prefix(name);
+    std::string path;
+    std::string context;
+    if (!get_property_area_path_value(kAppcompatDir, override_key, &path, &context, error)) {
+        return false;
+    }
+    if (!resetprop::set_property_in_file(path, override_key, value, error)) {
+        return false;
+    }
+    return bump_property_serial_for_root(kAppcompatDir, error);
+}
+
+static bool maybe_mirror_appcompat_delete(const char* name,
+                                          bool* deleted,
+                                          std::string* error) {
+    if (!directory_exists(kAppcompatDir) || !is_read_only_property(name)) {
+        return true;
+    }
+    bool appcompat_deleted = false;
+    std::string path;
+    std::string context;
+    const std::string override_key = strip_appcompat_prefix(name);
+    if (!get_property_area_path_value(kAppcompatDir, override_key, &path, &context, error)) {
+        return false;
+    }
+    if (!resetprop::delete_property_in_file(path, override_key, &appcompat_deleted, error)) {
+        return false;
+    }
+    if (appcompat_deleted && !bump_property_serial_for_root(kAppcompatDir, error)) {
+        return false;
+    }
+    *deleted = *deleted || appcompat_deleted;
+    return true;
+}
+
+static bool delete_property_from_area(const char* name, bool* deleted, std::string* error) {
+    std::string path;
+    std::string context;
+    if (!get_property_area_path_value(kPropertyDir, name, &path, &context, error)) {
+        return false;
+    }
+    return resetprop::delete_property_in_file(path, name, deleted, error);
+}
+
+static bool get_property_context_value(const std::string& name,
+                                       std::string* context,
+                                       std::string* error) {
+    return resetprop::resolve_property_context_from(kPropertyDir, name, context, error);
+}
+
+static bool get_property_area_path_value(const char* props_root,
+                                         const std::string& name,
+                                         std::string* path,
+                                         std::string* context,
+                                         std::string* error) {
+    return resetprop::resolve_property_area_path(props_root, name, path, context, error);
+}
+
+static bool bump_property_serial_for_root(const char* props_root, std::string* error) {
+    std::string path;
+    if (!resetprop::resolve_property_serial_path(props_root, &path, error)) {
+        return false;
+    }
+    return resetprop::bump_property_area_serial(path, error);
+}
+
+static bool get_property_value(const Options& options,
+                               const char* name,
+                               std::string* value,
+                               bool* found,
+                               std::string* error) {
+    *found = false;
+
+    if (options.show_context) {
+        if (!get_property_context_value(name, value, error)) {
+            return false;
+        }
+        *found = true;
+        return true;
+    }
+
+    if (options.show_area_path) {
+        std::string context;
+        if (!get_property_area_path_value(kPropertyDir, name, value, &context, error)) {
+            return false;
+        }
+        *found = true;
+        return true;
+    }
+
+    if (!options.persist_only) {
+        char raw[PROP_VALUE_MAX] = {};
+        if (prop_get(name, raw) >= 0) {
+            *value = raw;
+            *found = true;
+            return true;
+        }
+    }
+
+    if ((options.persist || options.persist_only) && is_persist_property(name)) {
+        return resetprop::get_persistent_property(name, value, found, error);
+    }
+
+    return true;
+}
+
+static bool list_properties(const Options& options,
+                            PropertyMap* properties,
+                            std::string* error) {
+    properties->clear();
+
+    if (!options.persist_only) {
+        if (__system_property_foreach(list_foreach_callback, properties) != 0) {
+            *error = "__system_property_foreach failed";
+            return false;
+        }
+    }
+
+    if (options.persist || options.persist_only) {
+        resetprop::PersistentPropertyMap persist_props;
+        if (!resetprop::list_persistent_properties(&persist_props, error)) {
+            return false;
+        }
+        for (const auto& [name, value] : persist_props) {
+            (*properties)[name] = value;
+        }
+    }
+
+    return true;
+}
+
+static bool set_property_value(const Options& options,
+                               const char* name,
+                               const char* value,
+                               std::string* error) {
+    const bool direct = options.skip_svc || std::strncmp(name, "ro.", 3) == 0;
+
+    if (direct) {
+        ScopedPropertyWriteAccess access;
+        if (!access.active()) {
+            *error = "failed to gain write access to property area";
+            return false;
+        }
+
+        if (is_read_only_property(name) || !set_property_direct(name, value)) {
+            std::string path;
+            std::string context;
+            if (!get_property_area_path_value(kPropertyDir, name, &path, &context, error)) {
+                return false;
+            }
+            if (!resetprop::set_property_in_file(path, name, value, error)) {
+                return false;
+            }
+            if (!bump_property_serial_for_root(kPropertyDir, error)) {
+                return false;
+            }
+        }
+        if (!maybe_mirror_appcompat_set(name, value, error)) {
+            return false;
+        }
+    } else if (__system_property_set(name, value) != 0) {
+        *error = "__system_property_set failed";
+        return false;
+    }
+
+    if (options.persist && is_persist_property(name) &&
+        !resetprop::set_persistent_property(name, value, error)) {
+        return false;
+    }
+
+    return true;
+}
+
+static bool delete_property_value(const Options& options,
+                                  const char* name,
+                                  bool* deleted,
+                                  std::string* error) {
+    *deleted = false;
+
+    if (!options.persist_only) {
+        ScopedPropertyWriteAccess access;
+        if (!access.active()) {
+            *error = "failed to gain write access to property area";
+            return false;
+        }
+        if (!delete_property_from_area(name, deleted, error)) {
+            return false;
+        }
+        if (*deleted && !bump_property_serial_for_root(kPropertyDir, error)) {
+            return false;
+        }
+        if (!maybe_mirror_appcompat_delete(name, deleted, error)) {
+            return false;
+        }
+    }
+
+    if (options.persist && is_persist_property(name)) {
+        bool persist_deleted = false;
+        if (!resetprop::delete_persistent_property(name, &persist_deleted, error)) {
+            return false;
+        }
+        *deleted = *deleted || persist_deleted;
+    }
+
+    return true;
+}
+
+static bool load_property_file(const Options& options, const char* path, std::string* error) {
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        *error = "failed to open property file";
+        return false;
+    }
+
+    std::string line;
+    std::size_t line_number = 0;
+    while (std::getline(file, line)) {
+        ++line_number;
+        const auto comment_pos = line.find('#');
+        if (comment_pos != std::string::npos) {
+            line.erase(comment_pos);
+        }
+        line = trim(std::move(line));
+        if (line.empty() || line.rfind("import ", 0) == 0) {
+            continue;
+        }
+
+        const auto equal_pos = line.find('=');
+        if (equal_pos == std::string::npos) {
+            continue;
+        }
+        std::string key = trim(line.substr(0, equal_pos));
+        std::string value = trim(line.substr(equal_pos + 1));
+        if (key.empty()) {
+            continue;
+        }
+        if (!set_property_value(options, key.c_str(), value.c_str(), error)) {
+            *error = "line " + std::to_string(line_number) + ": " + *error;
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool wait_for_property(const char* name,
+                              const char* old_value,
+                              const std::optional<double>& timeout_seconds,
+                              bool* timed_out) {
+    *timed_out = false;
+    const auto deadline = timeout_seconds.has_value()
+                              ? std::optional<std::chrono::steady_clock::time_point>(
+                                    std::chrono::steady_clock::now() +
+                                    std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                        std::chrono::duration<double>(*timeout_seconds)))
+                              : std::nullopt;
+
+    const auto wait_fn = resolve_property_wait();
+    const auto area_serial_fn = resolve_property_area_serial();
+
+    while (true) {
+        uint32_t global_serial = 0;
+        if (wait_fn != nullptr && area_serial_fn != nullptr) {
+            global_serial = area_serial_fn();
+        }
+
+        if (__system_property_find(name) != nullptr) {
+            break;
+        }
+
+        if (wait_fn != nullptr && area_serial_fn != nullptr) {
+            if (!wait_for_property_change(wait_fn, nullptr, global_serial, deadline, timed_out)) {
+                if (*timed_out) {
+                    return false;
+                }
+            }
+            continue;
+        }
+
+        if (deadline_reached(deadline)) {
+            *timed_out = true;
+            return false;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        const auto poll_interval =
+            std::chrono::duration_cast<std::chrono::steady_clock::duration>(kWaitPollInterval);
+        const auto sleep_for = deadline.has_value() ? std::min(poll_interval, *deadline - now)
+                                                    : poll_interval;
+        if (sleep_for > std::chrono::steady_clock::duration::zero()) {
+            std::this_thread::sleep_for(sleep_for);
+        }
+    }
+
+    if (old_value == nullptr) {
+        return true;
+    }
+
+    while (true) {
+        uint32_t global_serial = 0;
+        if (wait_fn != nullptr && area_serial_fn != nullptr) {
+            global_serial = area_serial_fn();
+        }
+
+        char value[PROP_VALUE_MAX] = {};
+        uint32_t prop_serial = 0;
+        const int rc = prop_get(name, value, &prop_serial);
+
+        if (rc < 0 || std::strcmp(value, old_value) != 0) {
+            return true;
+        }
+
+        bool waited = false;
+        if (wait_fn != nullptr && area_serial_fn != nullptr) {
+            waited = true;
+            if (!wait_for_property_change(wait_fn, nullptr, global_serial, deadline, timed_out)) {
+                if (*timed_out) {
+                    return false;
+                }
+            }
+        } else if (wait_fn != nullptr) {
+            const prop_info* pi = __system_property_find(name);
+            if (pi != nullptr) {
+                waited = true;
+                if (!wait_for_property_change(wait_fn, pi, prop_serial, deadline, timed_out)) {
+                    if (*timed_out) {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        if (waited) {
+            continue;
+        }
+
+        if (deadline_reached(deadline)) {
+            *timed_out = true;
+            return false;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        const auto poll_interval =
+            std::chrono::duration_cast<std::chrono::steady_clock::duration>(kWaitPollInterval);
+        const auto sleep_for = deadline.has_value() ? std::min(poll_interval, *deadline - now)
+                                                    : poll_interval;
+        if (sleep_for > std::chrono::steady_clock::duration::zero()) {
+            std::this_thread::sleep_for(sleep_for);
+        }
     }
 }
 
@@ -367,9 +1060,6 @@ static bool wait_for_property_value(const char* name, const char* expected) {
 }  // namespace
 
 extern "C" {
-
-/* Stub for NDK link; device libc may provide the real symbol at runtime. */
-int __system_properties_init(void) { return 0; }
 
 int resetprop_main(int argc, char** argv) {
     const char* prog = (argv && argv[0]) ? argv[0] : "resetprop";
@@ -381,72 +1071,212 @@ int resetprop_main(int argc, char** argv) {
 #else
 
 #if defined(__ANDROID_API__) && __ANDROID_API__ >= 26
-    if (__system_properties_init() != 0) {
-        std::cerr << "resetprop: __system_properties_init failed\n";
-        return 1;
+    if (const auto init_fn = resolve_properties_init(); init_fn != nullptr) {
+        if (init_fn() != 0) {
+            std::cerr << "resetprop: __system_properties_init failed\n";
+            return 1;
+        }
     }
 #endif
 
-    bool wait_mode = false;
-    std::vector<const char*> positional;
+    Options options;
+    std::string error;
+    if (!parse_options(argc, argv, &options, &error)) {
+        std::cerr << "resetprop: " << error << "\n";
+        usage(std::cerr, prog);
+        return 1;
+    }
+    g_verbose = options.verbose;
 
     for (int i = 1; i < argc; ++i) {
-        const char* arg = argv[i];
-        if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
+        if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0) {
             usage(std::cerr, prog);
             return 0;
         }
-        if (strcmp(arg, "-n") == 0) {
-            continue;
-        }
-        if (strcmp(arg, "-w") == 0) {
-            wait_mode = true;
-            continue;
-        }
-        positional.push_back(arg);
     }
 
-    if (wait_mode) {
-        if (positional.size() != 2) {
+    const int special_modes = static_cast<int>(options.wait_mode) +
+                              static_cast<int>(options.delete_mode) +
+                              static_cast<int>(options.compact_mode) +
+                              static_cast<int>(options.file != nullptr);
+    if (special_modes > 1) {
+        std::cerr << "resetprop: multiple operation modes detected\n";
+        return 1;
+    }
+    if (options.show_context && options.show_area_path) {
+        std::cerr << "resetprop: -Z and -A are mutually exclusive\n";
+        return 1;
+    }
+    if (options.persist_only &&
+        (options.delete_mode || options.compact_mode || options.file != nullptr ||
+         options.positional.size() == 2)) {
+        std::cerr << "resetprop: -P is read-only and cannot be combined with write operations\n";
+        return 1;
+    }
+    if (options.show_context_type || options.show_serial_path) {
+        if (options.wait_mode || options.delete_mode || options.compact_mode || options.file != nullptr ||
+            !options.positional.empty() || options.show_context || options.show_area_path) {
+            std::cerr << "resetprop: context-inspection flags cannot be combined with other modes\n";
+            return 1;
+        }
+        if (options.show_context_type) {
+            resetprop::PropertyContextType type;
+            if (!resetprop::detect_property_context_type(kPropertyDir, &type, &error)) {
+                std::cerr << "resetprop: " << error << "\n";
+                return 1;
+            }
+            std::cout << resetprop::property_context_type_name(type) << "\n";
+        }
+        if (options.show_serial_path) {
+            std::string path;
+            if (!resetprop::resolve_property_serial_path(kPropertyDir, &path, &error)) {
+                std::cerr << "resetprop: " << error << "\n";
+                return 1;
+            }
+            std::cout << path << "\n";
+        }
+        return 0;
+    }
+
+    if (options.wait_mode) {
+        if (options.positional.empty() || options.positional.size() > 2) {
             usage(std::cerr, prog);
             return 1;
         }
-        return wait_for_property_value(positional[0], positional[1]) ? 0 : 1;
-    }
-
-    if (positional.empty()) {
-        std::vector<std::pair<std::string, std::string>> props;
-        if (__system_property_foreach(list_foreach_callback, &props) != 0) {
-            std::cerr << "resetprop: __system_property_foreach failed\n";
+        bool timed_out = false;
+        if (!wait_for_property(options.positional[0],
+                               options.positional.size() == 2 ? options.positional[1] : nullptr,
+                               options.timeout_seconds,
+                               &timed_out)) {
+            if (timed_out) {
+                std::cerr << "resetprop: timeout waiting for " << options.positional[0] << "\n";
+                return 2;
+            }
             return 1;
         }
-        for (const auto& p : props)
-            std::cout << "[" << p.first << "]: [" << p.second << "]\n";
         return 0;
     }
 
-    if (positional.size() == 1) {
-        char value[PROP_VALUE_MAX];
-        if (prop_get(positional[0], value) < 0) {
-            std::cerr << "resetprop: property not found: " << positional[0] << "\n";
+    if (options.compact_mode) {
+        if (options.positional.size() > 1) {
+            usage(std::cerr, prog);
             return 1;
         }
-        std::cout << value << "\n";
-        return 0;
-    }
-
-    if (positional.size() == 2) {
-        // Force bionic to map the backing property area before we snapshot and remap it writable.
-        char current[PROP_VALUE_MAX] = {};
-        (void)prop_get(positional[0], current);
 
         ScopedPropertyWriteAccess access;
         if (!access.active()) {
             std::cerr << "resetprop: failed to gain write access to property area\n";
             return 1;
         }
-        if (!set_property_direct(positional[0], positional[1])) {
-            std::cerr << "resetprop: direct property update failed for " << positional[0] << "\n";
+
+        resetprop::CompactSummary summary;
+        const auto compact_one_dir = [&](const char* dir) -> bool {
+            resetprop::CompactSummary partial;
+            if (!resetprop::compact_property_areas(
+                    dir,
+                    options.positional.empty() ? std::nullopt
+                                               : std::optional<std::string>(options.positional[0]),
+                    &partial,
+                    &error)) {
+                return false;
+            }
+            summary.files_scanned += partial.files_scanned;
+            summary.valid_areas += partial.valid_areas;
+            summary.files_compacted += partial.files_compacted;
+            return true;
+        };
+
+        if (!compact_one_dir(kPropertyDir)) {
+            std::cerr << "resetprop: compact failed: " << error << "\n";
+            return 1;
+        }
+        if (directory_exists(kAppcompatDir) && !compact_one_dir(kAppcompatDir)) {
+            std::cerr << "resetprop: compact failed: " << error << "\n";
+            return 1;
+        }
+        if (summary.files_compacted == 0) {
+            std::cerr << "resetprop: nothing to compact\n";
+            return 1;
+        }
+        return 0;
+    }
+
+    if (options.file != nullptr) {
+        if (!options.positional.empty()) {
+            usage(std::cerr, prog);
+            return 1;
+        }
+        if (!load_property_file(options, options.file, &error)) {
+            std::cerr << "resetprop: " << error << "\n";
+            return 1;
+        }
+        return 0;
+    }
+
+    if (options.delete_mode) {
+        if (options.positional.size() != 1) {
+            usage(std::cerr, prog);
+            return 1;
+        }
+        bool deleted = false;
+        if (!delete_property_value(options, options.positional[0], &deleted, &error)) {
+            std::cerr << "resetprop: " << error << "\n";
+            return 1;
+        }
+        if (!deleted) {
+            std::cerr << "resetprop: property not found: " << options.positional[0] << "\n";
+            return 1;
+        }
+        return 0;
+    }
+
+    if (options.positional.empty()) {
+        PropertyMap properties;
+        if (!list_properties(options, &properties, &error)) {
+            std::cerr << "resetprop: " << error << "\n";
+            return 1;
+        }
+        for (const auto& [name, value] : properties) {
+            if (options.show_context) {
+                std::string context;
+                if (!get_property_context_value(name, &context, &error)) {
+                    std::cerr << "resetprop: " << error << "\n";
+                    return 1;
+                }
+                std::cout << "[" << name << "]: [" << context << "]\n";
+            } else if (options.show_area_path) {
+                std::string path;
+                std::string context;
+                if (!get_property_area_path_value(kPropertyDir, name, &path, &context, &error)) {
+                    std::cerr << "resetprop: " << error << "\n";
+                    return 1;
+                }
+                std::cout << "[" << name << "]: [" << path << "]\n";
+            } else {
+                std::cout << "[" << name << "]: [" << value << "]\n";
+            }
+        }
+        return 0;
+    }
+
+    if (options.positional.size() == 1) {
+        std::string value;
+        bool found = false;
+        if (!get_property_value(options, options.positional[0], &value, &found, &error)) {
+            std::cerr << "resetprop: " << error << "\n";
+            return 1;
+        }
+        if (!found) {
+            std::cerr << "resetprop: property not found: " << options.positional[0] << "\n";
+            return 1;
+        }
+        std::cout << value << "\n";
+        return 0;
+    }
+
+    if (options.positional.size() == 2) {
+        if (!set_property_value(options, options.positional[0], options.positional[1], &error)) {
+            std::cerr << "resetprop: " << error << "\n";
             return 1;
         }
         return 0;

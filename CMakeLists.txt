@@ -3,7 +3,12 @@ project(resetpropAlone LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 
-add_executable(resetprop src/main.cpp)
+add_executable(resetprop
+  src/main.cpp
+  src/persistent_props.cpp
+  src/prop_area.cpp
+  src/property_contexts.cpp
+)
 target_compile_definitions(resetprop PRIVATE RESETPROP_STANDALONE=1)
 if(CMAKE_SYSTEM_NAME STREQUAL "Android")
   target_link_libraries(resetprop PRIVATE log)
